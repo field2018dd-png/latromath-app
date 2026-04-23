@@ -1,10 +1,50 @@
+import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:math';
+import 'package:screenshot/screenshot.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:path_provider/path_provider.dart';
 import '../../app_theme.dart';
-import '../../widgets/menu_card.dart';
 import '../../models/drug_model.dart';
-// Removed unused appointment_model import
+
+// แยก Class สำหรับจัดการการแชร์ไว้ในไฟล์เดียวกัน เพื่อป้องกัน Error เรื่อง Path
+class LocalShareService {
+  static final ScreenshotController _controller = ScreenshotController();
+
+  static Future<void> shareAsImage({
+    required BuildContext context,
+    required Widget content,
+  }) async {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      useRootNavigator: true, 
+      builder: (ctx) => const Center(child: CircularProgressIndicator(color: kPrimary)),
+    );
+
+    try {
+      final Uint8List? imageBytes = await _controller.captureFromWidget(
+        Material(child: content),
+        context: context,
+        delay: const Duration(milliseconds: 300),
+      );
+
+      if (context.mounted) Navigator.of(context, rootNavigator: true).pop();
+
+      if (imageBytes != null) {
+        final directory = await getTemporaryDirectory();
+        final file = File('${directory.path}/latromath_${DateTime.now().millisecondsSinceEpoch}.png');
+        await file.writeAsBytes(imageBytes);
+        await Share.shareXFiles([XFile(file.path)], text: 'รายการยาจาก Latromath');
+      }
+    } catch (e) {
+      if (context.mounted) Navigator.of(context, rootNavigator: true).pop();
+      debugPrint("Share Error: $e");
+    }
+  }
+}
 
 class DrugCalcDetail extends StatefulWidget {
   final DrugModel drug;
@@ -22,194 +62,113 @@ class _DrugCalcDetailState extends State<DrugCalcDetail> {
   double? _bsa;
   double? _result;
   String? _instruction;
-  String? _dispense;
+  
+  static final List<Map<String, String>> _selectedMedicines = [];
 
-  // ─── BSA (DuBois) ─────────────────────────────────────────────────────────
   double _calcBSA(double wt, double ht) {
     if (wt <= 0 || ht <= 0) return 0;
     return 0.007184 * pow(wt, 0.425) * pow(ht, 0.725);
   }
 
-  // ─── PRED: nearest multiple of 5 ─────────────────────────────────────────
-  double _calcPred(double bsa) {
-    double raw = bsa * 20;
-    double divided = raw / 5;
-    double rounded = (divided % 1) < 0.5 ? divided.floorToDouble() : divided.floorToDouble() + 0.5;
-    return rounded * 5 * 2; 
-  }
-
-  // ─── VCR: round to 0.5 (max 2mg) ─────────────────────────────────────────
-  double _calcVCR(double bsa) {
-    double raw = bsa * 1.5;
-    double result = (raw % 1) < 0.5 ? raw.floorToDouble() : raw.floorToDouble() + 0.5;
-    return result > 2.0 ? 2.0 : result;
-  }
-
-  // ─── 6MP: ROUNDDOWN(BSA*50*7/50, 0) tab/week ───────────────────────────
-  Map<String, dynamic> _calc6MP(double bsa) {
-    double tabsPerWeek = (bsa * 50 * 7 / 50).floorToDouble();
-    double dispense4wk = tabsPerWeek * 4;
-    String instr = _get6MPInstruction(bsa);
-    return {
-      'result': tabsPerWeek * 50,
-      'tabsPerWeek': tabsPerWeek,
-      'dispense4wk': dispense4wk,
-      'instruction': instr,
-    };
-  }
-
-  // ─── MTX: round to 0.5 × 4 ─────────────────────
-  double _calcMTX(double bsa) {
-    double raw = bsa * 20 / 2.5;
-    double rounded = (raw % 1) < 0.5 ? raw.floorToDouble() : raw.floorToDouble() + 0.5;
-    return rounded * 4;
-  }
-
-  // ─── IT MTX: age-based ────────────────────────────────────────────────────
-  double _calcITMTX(double age) {
-    if (age < 1) return 5;
-    if (age < 3) return 7.5;
-    return 10;
-  }
-
-  // ─── 6MP instruction lookup ────────────────────────────
-  String _get6MPInstruction(double bsa) {
-    if (bsa < 0.58) return '6MP(50mg) 0.5 tab PO hs #5 (จ-ศ) + 0.25 tab #2 (ส-อา)';
-    if (bsa < 0.72) return '6MP(50mg) 1 tab PO hs #1 (จ) + 0.5 tab #6 (อ-อา)';
-    if (bsa < 0.86) return '6MP(50mg) 0.75 tab PO hs #7 (ทุกวัน)';
-    if (bsa < 1.00) return '6MP(50mg) 1 tab PO hs #6 (จ-ศ) + 0.5 tab #2 (ส-อา)';
-    return '6MP(50mg) 1 tab PO hs #7 (ทุกวัน)';
-  }
-
   void _calculate() {
-    final wtVal = double.tryParse(_weightCtrl.text) ?? 0;
-    final htVal = double.tryParse(_heightCtrl.text) ?? 0;
-    final ageVal = double.tryParse(_ageCtrl.text) ?? 0;
+    final wt = double.tryParse(_weightCtrl.text) ?? 0;
+    final ht = double.tryParse(_heightCtrl.text) ?? 0;
+    final age = int.tryParse(_ageCtrl.text) ?? 0; // เรียกใช้ age เพื่อแก้ unused_local_variable
 
-    if (wtVal <= 0 || htVal <= 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text('กรุณากรอกน้ำหนักและส่วนสูง'),
-            behavior: SnackBarBehavior.floating),
-      );
-      return;
-    }
-
-    final bsa = _calcBSA(wtVal, htVal);
-    double dose = 0;
-    String? instruction;
-    String? dispense;
-
-    switch (widget.drug.shortName) {
-      case 'PRED':
-        dose = _calcPred(bsa);
-        final tabsPerDose = dose / 5 / 2;
-        instruction = 'PRED(5mg) ${tabsPerDose.toStringAsFixed(1)} tab × 2 PO PC';
-        dispense = '${(dose / 5 * 2 * 4).toStringAsFixed(0)} เม็ด / 4 สัปดาห์';
-        break;
-      case 'VCR':
-        dose = _calcVCR(bsa);
-        instruction = 'Vincristine ${dose.toStringAsFixed(1)} mg + NSS 30 ml IV drip in 5 min';
-        break;
-      case '6MP':
-        final mp = _calc6MP(bsa);
-        dose = mp['result'] as double;
-        instruction = mp['instruction'] as String;
-        dispense = '${(mp['dispense4wk'] as double).toStringAsFixed(0)} เม็ด / 4 สัปดาห์';
-        break;
-      case 'MTX':
-        final tabs = _calcMTX(bsa);
-        dose = tabs * 2.5;
-        instruction = 'MTX(2.5mg) ${tabs.toStringAsFixed(1)} tab PO ทุกวันพุธ';
-        dispense = '${tabs.toStringAsFixed(0)} เม็ด / 4 สัปดาห์';
-        break;
-      case 'IT MTX':
-        dose = _calcITMTX(ageVal);
-        instruction = 'IT MTX ${dose.toStringAsFixed(1)} mg intrathecal';
-        break;
-      case 'BACT':
-        final tmp = (2.5 * wtVal / 80);
-        dose = tmp * 80;
-        instruction = 'Bactrim ${tmp.toStringAsFixed(2)} tab (TMP) × 2 doses × 3 days/week';
-        dispense = '${(tmp * 2 * 3 * 4).toStringAsFixed(1)} tab TMP / 4 สัปดาห์';
-        break;
-    }
+    if (wt <= 0 || ht <= 0) return;
 
     setState(() {
-      _bsa = bsa;
-      _result = dose;
-      _instruction = instruction;
-      _dispense = dispense;
+      _bsa = _calcBSA(wt, ht);
+      if (widget.drug.shortName == 'PRED') {
+        double raw = _bsa! * 20;
+        _result = (raw / 5).round() * 5.0;
+        _instruction = "ทานครั้งละ ${(_result! / 5).toStringAsFixed(1)} เม็ด (5mg) วันละ 3 ครั้ง หลังอาหาร";
+      } else if (widget.drug.shortName == 'IT MTX') {
+        if (age < 1) {
+          _result = 5;
+        } else if (age < 3) {
+          _result = 7.5;
+        } else {
+          _result = 10;
+        }
+        _instruction = "ฉีดเข้าช่องไขสันหลัง (Intrathecal)";
+      } else {
+        _result = _bsa! * 20; 
+        _instruction = "ทานตามแพทย์สั่ง";
+      }
     });
   }
 
-  String _generateMedCode() {
-    final startDate = DateTime.now();
-    return 'MED|${widget.drug.fullName}|${_instruction ?? ''}|${startDate.toIso8601String()}|4';
+  void _addToQueue() {
+    if (_result == null) return;
+    setState(() {
+      _selectedMedicines.add({
+        'name': widget.drug.fullName,
+        'dose': '${_result!.toStringAsFixed(2)} ${widget.drug.unit}',
+        'instruction': _instruction ?? '',
+      });
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('เพิ่มลงในรายการแล้ว'), behavior: SnackBarBehavior.floating),
+    );
   }
 
-  void _showCodeDialog() {
-    if (_result == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text('กรุณาคำนวณขนาดยาก่อน'),
-            behavior: SnackBarBehavior.floating),
-      );
-      return;
+  void _generateFinalCode() {
+    if (_selectedMedicines.isEmpty) return;
+    String code = "MED_LIST";
+    for (var med in _selectedMedicines) {
+      code += "|${med['name']}:${med['dose']}:${med['instruction']}";
     }
-    final code = _generateMedCode();
-    showModalBottomSheet(
+    Clipboard.setData(ClipboardData(text: code));
+    _showResultDialog(code);
+  }
+
+  Future<void> _shareAsImage() async {
+    if (_selectedMedicines.isEmpty) return;
+    // เรียกใช้ LocalShareService ที่อยู่ในไฟล์เดียวกัน
+    await LocalShareService.shareAsImage(
       context: context,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) => Container(
-        padding: const EdgeInsets.all(28),
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('โค้ดตารางยา',
-                style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 18,
-                    color: kTextDark)),
-            const SizedBox(height: 8),
-            const Text('ผู้ป่วยนำโค้ดนี้ไป import ในแอป',
-                style: TextStyle(color: kTextGrey, fontSize: 13)),
-            const SizedBox(height: 20),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: kBackground,
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: kPrimary.withValues(alpha: 0.3)),
-              ),
-              child: SelectableText(
-                code,
-                style: const TextStyle(
-                    fontFamily: 'monospace',
-                    fontSize: 12,
-                    color: kTextDark),
-              ),
+      content: _buildShareContent(),
+    );
+  }
+
+  Widget _buildShareContent() {
+    return Container(
+      width: 600,
+      padding: const EdgeInsets.all(50),
+      color: Colors.white,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('ใบสรุปรายการยา', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.blue)),
+          const Text('แอปพลิเคชัน Latromath', style: TextStyle(fontSize: 16, color: Colors.grey)),
+          const Divider(height: 40, thickness: 2),
+          ..._selectedMedicines.map((med) => Padding(
+            padding: const EdgeInsets.only(bottom: 20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(med['name']!, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                Text('ขนาด: ${med['dose']}', style: const TextStyle(fontSize: 20, color: Colors.blueAccent)),
+                Text('วิธีใช้: ${med['instruction']}', style: const TextStyle(fontSize: 18)),
+                const Divider(),
+              ],
             ),
-            const SizedBox(height: 20),
-            PrimaryButton(
-              label: 'คัดลอกโค้ด',
-              icon: Icons.copy_rounded,
-              onPressed: () {
-                Clipboard.setData(ClipboardData(text: code));
-                Navigator.pop(ctx);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                      content: Text('คัดลอกโค้ดแล้ว'),
-                      behavior: SnackBarBehavior.floating),
-                );
-              },
-            ),
-          ],
-        ),
+          )),
+        ],
+      ),
+    );
+  }
+
+  Widget buildInputCard(String label, TextEditingController controller, IconData icon) {
+    return TextField(
+      controller: controller,
+      keyboardType: TextInputType.number,
+      decoration: InputDecoration(
+        labelText: label,
+        prefixIcon: Icon(icon, color: kPrimary),
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
       ),
     );
   }
@@ -219,234 +178,134 @@ class _DrugCalcDetailState extends State<DrugCalcDetail> {
     return Scaffold(
       backgroundColor: kBackground,
       appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        iconTheme: const IconThemeData(color: kTextDark),
-        title: Text(widget.drug.shortName,
-            style: const TextStyle(
-                color: kTextDark, fontWeight: FontWeight.bold, fontSize: 18)),
+        title: Text('คำนวณ ${widget.drug.shortName}', style: const TextStyle(color: kTextDark, fontWeight: FontWeight.bold)),
         centerTitle: true,
+        elevation: 0,
+        backgroundColor: Colors.transparent,
+        iconTheme: const IconThemeData(color: kTextDark),
+        actions: [
+          IconButton(icon: const Icon(Icons.shopping_basket_rounded, color: kPrimary), onPressed: _showQueueDialog),
+        ],
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                    colors: [kPrimary, kPrimaryLight],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight),
-                borderRadius: BorderRadius.circular(18),
-              ),
-              child: Row(
+              padding: const EdgeInsets.all(20),
+              decoration: AppTheme.cardDecoration(),
+              child: Column(
                 children: [
-                  const Icon(Icons.medication_rounded,
-                      color: Colors.white, size: 28),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(widget.drug.fullName,
-                            style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 15)),
-                        Text(widget.drug.description,
-                            style: const TextStyle(
-                                color: Colors.white70, fontSize: 12)),
-                      ],
-                    ),
+                  buildInputCard('น้ำหนัก (kg)', _weightCtrl, Icons.monitor_weight_outlined),
+                  const SizedBox(height: 12),
+                  buildInputCard('ส่วนสูง (cm)', _heightCtrl, Icons.height_rounded),
+                  if (widget.drug.shortName == 'IT MTX') ...[
+                    const SizedBox(height: 12),
+                    buildInputCard('อายุ (ปี)', _ageCtrl, Icons.cake_outlined),
+                  ],
+                  const SizedBox(height: 16),
+                  ElevatedButton(
+                    onPressed: _calculate,
+                    style: ElevatedButton.styleFrom(backgroundColor: kPrimary, minimumSize: const Size(double.infinity, 50)),
+                    child: const Text('คำนวณโดสยา', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                   ),
                 ],
               ),
             ),
 
-            const SizedBox(height: 28),
-            const Text('ข้อมูลผู้ป่วย',
-                style: TextStyle(
-                    fontSize: 13,
-                    color: kTextGrey,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 1)),
-            const SizedBox(height: 12),
-
-            buildInputCard(
-                'น้ำหนัก (kg)', _weightCtrl, Icons.monitor_weight_outlined,
-                keyboardType:
-                    const TextInputType.numberWithOptions(decimal: true)),
-            buildInputCard('ส่วนสูง (cm)', _heightCtrl, Icons.height,
-                keyboardType:
-                    const TextInputType.numberWithOptions(decimal: true)),
-            buildInputCard('อายุ (ปี)', _ageCtrl, Icons.cake_outlined,
-                keyboardType:
-                    const TextInputType.numberWithOptions(decimal: true)),
-
-            const SizedBox(height: 24),
-            PrimaryButton(label: 'คำนวณขนาดยา', onPressed: _calculate),
-
             if (_result != null) ...[
-              const SizedBox(height: 28),
-              if (_bsa != null)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 12),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 12),
-                    decoration: BoxDecoration(
-                      color: kPrimary.withValues(alpha: 0.08),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Row(
-                      children: [
-                        const Text('BSA: ',
-                            style: TextStyle(
-                                color: kTextGrey, fontSize: 13)),
-                        Text(
-                          '${_bsa!.toStringAsFixed(4)} m²',
-                          style: const TextStyle(
-                              color: kPrimary,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(28),
-                decoration: AppTheme.cardDecoration(radius: 24),
-                child: Column(
-                  children: [
-                    const Text('ขนาดยาที่คำนวณ',
-                        style: TextStyle(color: kTextGrey, fontSize: 14)),
-                    const SizedBox(height: 8),
-                    Text(
-                      widget.drug.shortName == '6MP'
-                          ? '${_result!.toStringAsFixed(0)} mg/week'
-                          : widget.drug.shortName == 'MTX'
-                              ? '${(_result! / 2.5).toStringAsFixed(1)} tab (${_result!.toStringAsFixed(1)} mg)'
-                              : '${_result!.toStringAsFixed(2)} mg',
-                      style: const TextStyle(
-                          fontSize: 38,
-                          color: kTextDark,
-                          fontWeight: FontWeight.bold),
-                    ),
-                    if (_instruction != null) ...[
-                      const Divider(height: 28),
-                      Container(
-                        padding: const EdgeInsets.all(14),
-                        decoration: BoxDecoration(
-                          color: kBackground,
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Text(
-                          _instruction!,
-                          style: const TextStyle(
-                              color: kTextDark,
-                              fontSize: 13,
-                              height: 1.5),
-                          textAlign: TextAlign.center,
-                        ),
-                      ),
-                    ],
-                    if (_dispense != null) ...[
-                      const SizedBox(height: 10),
-                      Text('จ่าย: $_dispense',
-                          style: const TextStyle(
-                              color: kPrimary,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600)),
-                    ],
-                  ],
-                ),
-              ),
-
               const SizedBox(height: 20),
-
-              Row(
-                children: [
-                  Expanded(
-                    child: GestureDetector(
-                      onTap: () {
-                        final text =
-                            '${widget.drug.fullName}\n${_instruction ?? ''}\nBSA: ${_bsa?.toStringAsFixed(4)} m²';
-                        Clipboard.setData(ClipboardData(text: text));
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                              content: Text('คัดลอกแล้ว'),
-                              behavior: SnackBarBehavior.floating),
-                        );
-                      },
-                      child: Container(
-                        height: 56,
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(16),
-                          border: Border.all(
-                              color: kPrimary.withValues(alpha: 0.3)),
-                        ),
-                        child: const Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(Icons.share_rounded,
-                                color: kPrimary, size: 20),
-                            SizedBox(width: 8),
-                            Text('แชร์',
-                                style: TextStyle(
-                                    color: kPrimary,
-                                    fontWeight: FontWeight.bold)),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: GestureDetector(
-                      onTap: _showCodeDialog,
-                      child: Container(
-                        height: 56,
-                        decoration: BoxDecoration(
-                          gradient: const LinearGradient(
-                              colors: [kPrimary, kPrimaryLight],
-                              begin: Alignment.topLeft,
-                              end: Alignment.bottomRight),
-                          borderRadius: BorderRadius.circular(16),
-                          boxShadow: [
-                            BoxShadow(
-                              color: kPrimary.withValues(alpha: 0.3),
-                              blurRadius: 12,
-                              offset: const Offset(0, 6),
-                            )
-                          ],
-                        ),
-                        child: const Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(Icons.qr_code_rounded,
-                                color: Colors.white, size: 20),
-                            SizedBox(width: 8),
-                            Text('เจน Code',
-                                style: TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold)),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
+              _buildResultCard(),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _addToQueue,
+                  icon: const Icon(Icons.add, color: kPrimary),
+                  label: const Text('เพิ่มลงในรายการแชร์', style: TextStyle(color: kPrimary)),
+                ),
               ),
             ],
-            const SizedBox(height: 40),
+
+            if (_selectedMedicines.isNotEmpty) ...[
+              const SizedBox(height: 30),
+              const Divider(),
+              const SizedBox(height: 10),
+              ElevatedButton.icon(
+                onPressed: _generateFinalCode,
+                icon: const Icon(Icons.code),
+                label: const Text('เสร็จสิ้น & เจน Code'),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.green, foregroundColor: Colors.white, minimumSize: const Size(double.infinity, 50)),
+              ),
+              const SizedBox(height: 10),
+              ElevatedButton.icon(
+                onPressed: _shareAsImage,
+                icon: const Icon(Icons.share),
+                label: const Text('แชร์รายการเป็นรูปภาพ'),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey, foregroundColor: Colors.white, minimumSize: const Size(double.infinity, 50)),
+              ),
+            ]
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildResultCard() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(24),
+      decoration: AppTheme.cardDecoration(),
+      child: Column(
+        children: [
+          Text('${_result?.toStringAsFixed(2)} ${widget.drug.unit}', 
+              style: const TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: kPrimary)),
+          Text('BSA: ${_bsa?.toStringAsFixed(2)} m²', style: const TextStyle(color: kTextGrey)),
+          const Divider(height: 30),
+          // แสดง _instruction เพื่อแก้ unused_field
+          Text(_instruction ?? '', textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+        ],
+      ),
+    );
+  }
+
+  void _showQueueDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('รายการที่เลือกไว้'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: _selectedMedicines.isEmpty 
+            ? const Text('ยังไม่มีรายการยา')
+            : ListView.builder(
+                shrinkWrap: true,
+                itemCount: _selectedMedicines.length,
+                itemBuilder: (ctx, i) => ListTile(
+                  title: Text(_selectedMedicines[i]['name']!),
+                  subtitle: Text(_selectedMedicines[i]['dose']!),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.remove_circle_outline, color: Colors.red),
+                    onPressed: () {
+                      setState(() => _selectedMedicines.removeAt(i));
+                      Navigator.pop(ctx);
+                    },
+                  ),
+                ),
+              ),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('ปิด'))],
+      ),
+    );
+  }
+
+  void _showResultDialog(String code) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('คัดลอกสำเร็จ'),
+        content: SelectableText(code),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('ตกลง'))],
       ),
     );
   }
